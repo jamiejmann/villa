@@ -1,0 +1,184 @@
+# Independent test of ScrollPrize/villa PR #2533 (vc_reader on Windows with Visual Studio's clang-cl).
+# Lives only on jamiejmann/villa branch test-pr2533-windows. Builds vc_reader following the PR's
+# instructions on a GitHub windows-latest runner, runs villa's flat ink inference with Reader V3 on
+# PHerc1447 w058 (CPU), repeats it with the pure-Python vcr_lite, and compares both with the team's map.
+name: Test PR 2533 on Windows
+
+on:
+  push:
+    branches: [test-pr2533-windows]
+
+permissions:
+  contents: read
+
+env:
+  SV: s3://vesuvius-challenge-open-data/PHerc1447/segments/20260928183143-w058/surface-volumes/8.64um-1.2m-116keV-volume-20250521151220.zarr
+  TEAM_MAP: https://vesuvius-challenge-open-data.s3.amazonaws.com/PHerc1447/segments/20260928183143-w058/ink-detection/PHerc1447-20260928183143-8.64um-1.2m-116keV-volume-20250521151220-20261019111505-reader-v3-tile384-stride192.tif
+  CKPT_URL: https://huggingface.co/domenicor046/reader-v3/resolve/main/reader-v3.pth
+  CKPT_SHA256: ea405417450abd8ace1b8ff79ebce3adb646c5e48ab95da46844d77efe984d8a
+  ROI: "1500 3548 800 4896"     # same 2048 x 4096 area as vesuvius-cpu-reader's README
+  VCPKG_PKGS: blosc blosc2[zstd] boost-core concurrentqueue curl libjpeg-turbo libpng lz4 nlohmann-json sqlite3 tiff zlib zstd pkgconf
+  PYTHONUNBUFFERED: "1"
+
+jobs:
+  test:
+    runs-on: windows-latest
+    timeout-minutes: 240
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Get vesuvius-cpu-reader (vcr_lite)
+        uses: actions/checkout@v4
+        with:
+          repository: jamiejmann/vesuvius-cpu-reader
+          path: cpu-reader
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Find Visual Studio's clang-cl and record versions
+        run: |
+          New-Item -ItemType Directory -Force results | Out-Null
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath
+          $llvm = Join-Path $vs "VC\Tools\Llvm\x64\bin"
+          if (-not (Test-Path "$llvm\clang-cl.exe")) { throw "Visual Studio clang-cl not found under $llvm" }
+          $builtins = Get-ChildItem "$vs\VC\Tools\Llvm\x64\lib\clang\*\lib\windows\clang_rt.builtins-x86_64.lib" | Select-Object -First 1
+          "$llvm" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+          "VS_LLVM=$llvm" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "CLANG_BUILTINS=$($builtins.FullName -replace '\\','/')" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          $env:PATH = "$llvm;$env:PATH"
+          $v = @()
+          $v += "runner image: $env:ImageOS $env:ImageVersion"
+          $v += "OS: " + (Get-CimInstance Win32_OperatingSystem).Caption + " " + [Environment]::OSVersion.Version
+          $v += "CPU: " + (Get-CimInstance Win32_Processor | Select-Object -First 1).Name + " (" + [Environment]::ProcessorCount + " logical)"
+          $v += "RAM GB: " + [math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB, 1)
+          $v += "Visual Studio: " + (& "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property catalog_productDisplayVersion) + " at $vs"
+          $v += "clang-cl: " + ((& "$llvm\clang-cl.exe" --version) -join ' | ')
+          $v += "lld-link: " + ((& "$llvm\lld-link.exe" --version) -join ' ')
+          $v += "MSVC cl: " + ((cmd /c "cl 2>&1" | Select-Object -First 1))
+          $v += "cmake: " + ((cmake --version) | Select-Object -First 1)
+          $v += "ninja: " + (ninja --version)
+          $v += "python: " + (python --version)
+          $v += "vcpkg: " + ((& "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" version) | Select-Object -First 1) + " commit " + (git -C $env:VCPKG_INSTALLATION_ROOT rev-parse --short HEAD)
+          $v += "clang builtins: $($builtins.FullName)"
+          $v += "villa commit: $(git rev-parse HEAD) ($(git log -1 --format=%s))"
+          $v | Tee-Object results/versions.txt
+
+      - name: Restore vcpkg binary cache
+        id: vcache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/vcpkg-bin
+          key: vcpkg-bin-static-md-v1-${{ hashFiles('.github/workflows/test-pr2533-windows.yml') }}
+          restore-keys: vcpkg-bin-static-md-v1-
+
+      - name: vcpkg install (PR's package list, x64-windows-static-md)
+        run: |
+          $env:VCPKG_DEFAULT_BINARY_CACHE = "$env:RUNNER_TEMP\vcpkg-bin"
+          New-Item -ItemType Directory -Force $env:VCPKG_DEFAULT_BINARY_CACHE | Out-Null
+          $t = Measure-Command {
+            & "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" install $env:VCPKG_PKGS.Split(' ') --triplet x64-windows-static-md --host-triplet x64-windows 2>&1 | Tee-Object results/vcpkg.log
+            if ($LASTEXITCODE -ne 0) { throw "vcpkg install failed" }
+            & "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" install pkgconf:x64-windows 2>&1 | Tee-Object -Append results/vcpkg.log
+            if ($LASTEXITCODE -ne 0) { throw "vcpkg install pkgconf failed" }
+          }
+          "vcpkg_install_seconds=$([int]$t.TotalSeconds)" | Tee-Object -Append results/timings.txt
+
+      - name: Save vcpkg binary cache
+        if: steps.vcache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/vcpkg-bin
+          key: vcpkg-bin-static-md-v1-${{ hashFiles('.github/workflows/test-pr2533-windows.yml') }}
+
+      - name: Native venv (CPU torch + villa inference deps)
+        run: |
+          python -m venv C:\venv-native
+          C:\venv-native\Scripts\python -m pip install --upgrade pip 2>&1 | Out-Null
+          C:\venv-native\Scripts\python -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+          C:\venv-native\Scripts\python -m pip install -r cpu-reader/requirements-cpu.txt
+          C:\venv-native\Scripts\python -m pip freeze | Out-File results/pip_freeze_native.txt
+
+      - name: Build vc_reader with clang-cl (PR #2533 instructions)
+        run: |
+          $vc = ($env:VCPKG_INSTALLATION_ROOT -replace '\\','/')
+          $pc = "$vc/installed/x64-windows/tools/pkgconf/pkgconf.exe"
+          if (-not (Test-Path $pc)) { $pc = (Get-ChildItem "$env:VCPKG_INSTALLATION_ROOT\installed\*\tools\pkgconf\pkgconf.exe" | Select-Object -First 1).FullName -replace '\\','/' }
+          $env:CC = "clang-cl"
+          $env:CXX = "clang-cl"
+          $env:CMAKE_GENERATOR = "Ninja"
+          $env:CMAKE_TOOLCHAIN_FILE = "$vc/scripts/buildsystems/vcpkg.cmake"
+          $env:PKG_CONFIG_PATH = "$vc/installed/x64-windows-static-md/lib/pkgconfig"
+          $env:SKBUILD_CMAKE_DEFINE = "VC_CLANG_BUILTINS=$env:CLANG_BUILTINS"
+          $env:VCPKG_TARGET_TRIPLET = "x64-windows-static-md"
+          $env:PKG_CONFIG = $pc
+          $env:CMAKE_ARGS = "-DVCPKG_TARGET_TRIPLET=x64-windows-static-md -DVCPKG_HOST_TRIPLET=x64-windows -DVC_READER_ENABLE_CUDA=OFF -DPKG_CONFIG_EXECUTABLE=$pc"
+          Get-ChildItem env: | Where-Object { $_.Name -match '^(CC|CXX|CMAKE_|PKG_CONFIG|SKBUILD|VCPKG_TARGET)' } | Format-Table -AutoSize | Out-String -Width 400 | Tee-Object results/build_env.txt
+          $t = Measure-Command {
+            C:\venv-native\Scripts\python -m pip install -v ./vc_reader 2>&1 | Tee-Object results/build_vc_reader.log
+            if ($LASTEXITCODE -ne 0) { throw "pip install ./vc_reader failed (see results/build_vc_reader.log)" }
+          }
+          "vc_reader_build_seconds=$([int]$t.TotalSeconds)" | Tee-Object -Append results/timings.txt
+
+      - name: Import check
+        run: |
+          C:\venv-native\Scripts\python -c "import vc_reader, vc_reader.reader, vc_reader.transforms, vc_reader.images; print('vc_reader', vc_reader.__file__, 'LITE' if getattr(vc_reader,'LITE',False) else 'native')" 2>&1 | Tee-Object results/import_check.txt
+          if ($LASTEXITCODE -ne 0) { throw "import failed" }
+
+      - name: Download Reader V3 checkpoint and team map
+        run: |
+          New-Item -ItemType Directory -Force C:\data | Out-Null
+          curl.exe -sSfL -o C:\data\reader-v3.pth $env:CKPT_URL
+          $h = (Get-FileHash C:\data\reader-v3.pth -Algorithm SHA256).Hash.ToLower()
+          if ($h -ne $env:CKPT_SHA256) { throw "checkpoint sha256 mismatch: $h" }
+          curl.exe -sSfL -o C:\data\team_reader_v3.tif $env:TEAM_MAP
+
+      - name: Ink inference with native vc_reader (villa CLI, CPU)
+        run: |
+          $env:PYTHONPATH = "$env:GITHUB_WORKSPACE\vesuvius\src"
+          $roi = $env:ROI.Split(' ')
+          $t = Measure-Command {
+            C:\venv-native\Scripts\python -m vesuvius.ink_detection.inference.infer $env:SV C:\data\reader-v3.pth results\w058_native.tif --device cpu --overlap 0.5 --blend-mode hann --direction forward --batch-size 2 --no-compile --roi @roi 2>&1 | Tee-Object results/infer_native.log
+            if ($LASTEXITCODE -ne 0) { throw "native inference failed" }
+          }
+          "infer_native_seconds=$([int]$t.TotalSeconds)" | Tee-Object -Append results/timings.txt
+
+      - name: Same inference with vcr_lite (pure Python)
+        run: |
+          python -m venv C:\venv-lite
+          C:\venv-lite\Scripts\python -m pip install --upgrade pip 2>&1 | Out-Null
+          C:\venv-lite\Scripts\python -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+          C:\venv-lite\Scripts\python -m pip install -r cpu-reader/requirements-cpu.txt ./cpu-reader/vcr_lite
+          $env:PYTHONPATH = "$env:GITHUB_WORKSPACE\vesuvius\src"
+          $roi = $env:ROI.Split(' ')
+          $t = Measure-Command {
+            C:\venv-lite\Scripts\python -m vesuvius.ink_detection.inference.infer $env:SV C:\data\reader-v3.pth results\w058_lite.tif --device cpu --overlap 0.5 --blend-mode hann --direction forward --batch-size 2 --no-compile --roi @roi 2>&1 | Tee-Object results/infer_lite.log
+            if ($LASTEXITCODE -ne 0) { throw "vcr_lite inference failed" }
+          }
+          "infer_lite_seconds=$([int]$t.TotalSeconds)" | Tee-Object -Append results/timings.txt
+
+      - name: Compare native vs vcr_lite vs team map
+        run: |
+          $roi = $env:ROI.Split(' ')
+          C:\venv-lite\Scripts\python .github/pr2533-test/compare.py results\w058_native.tif results\w058_lite.tif C:\data\team_reader_v3.tif @roi results\compare.json
+          if ($LASTEXITCODE -ne 0) { throw "compare failed" }
+          Get-Content results/timings.txt
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pr2533-windows-results
+          path: |
+            results/
+            vc_reader/build/*/CMakeFiles/CMakeConfigureLog.yaml
+          retention-days: 30
